@@ -3,7 +3,7 @@ import { auth } from './firebase'
 import { onAuthStateChanged, signOut } from 'firebase/auth'
 import Auth from './Auth'
 
-const API_URL = 'http://localhost:8000'
+const API_URL = 'https://nuerax-hackathon.onrender.com'
 
 function App() {
   const [user, setUser] = useState(null)
@@ -49,7 +49,7 @@ function App() {
 
   const connectWebSocket = () => {
     try {
-      const ws = new WebSocket(`ws://localhost:8000/ws/${sessionId}`)
+      const ws = new WebSocket(`wss://nuerax-hackathon.onrender.com/ws/${sessionId}`)
       ws.onopen = () => console.log('Connected to NEXUS AGENT')
       ws.onmessage = (event) => {
         try {
