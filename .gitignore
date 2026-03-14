@@ -1,0 +1,22 @@
+@"
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.db
+uploads/
+chroma_db/
+memory/chroma_db/
+*.sqlite
+*.sqlite3
+
+# Node
+node_modules/
+dist/
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+"@ | Out-File -FilePath .gitignore -Encoding utf8
