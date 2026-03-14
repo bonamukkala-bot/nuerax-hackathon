@@ -1,49 +1,27 @@
 import os
 from typing import List, Dict, Any, Optional
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import FakeEmbeddings
-from langchain.schema import Document
-
-CHROMA_DB_PATH = os.path.join(os.path.dirname(__file__), "chroma_db")
 
 
 class LongTermMemory:
     def __init__(self):
-        self.embeddings = FakeEmbeddings(size=384)
-        self.vectorstore = None
-        self._init_vectorstore()
-
-    def _init_vectorstore(self):
-        try:
-            self.vectorstore = Chroma(
-                collection_name="nexus_memory",
-                embedding_function=self.embeddings,
-                persist_directory=CHROMA_DB_PATH
-            )
-        except Exception as e:
-            print(f"ChromaDB init warning: {e}")
-            self.vectorstore = None
+        self.documents = []
 
     def add_documents(self, texts: List[str], metadatas: Optional[List[Dict]] = None):
-        if not texts or self.vectorstore is None:
-            return
-        try:
-            docs = []
-            for i, text in enumerate(texts):
-                metadata = metadatas[i] if metadatas and i < len(metadatas) else {}
-                docs.append(Document(page_content=text, metadata=metadata))
-            self.vectorstore.add_documents(docs)
-        except Exception as e:
-            print(f"Error adding to long term memory: {e}")
+        for i, text in enumerate(texts):
+            metadata = metadatas[i] if metadatas and i < len(metadatas) else {}
+            self.documents.append({"content": text, "metadata": metadata})
 
     def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        if self.vectorstore is None:
+        if not self.documents:
             return []
-        try:
-            results = self.vectorstore.similarity_search_with_score(query, k=k)
-            return [{"content": doc.page_content, "metadata": doc.metadata, "score": float(score)} for doc, score in results]
-        except Exception:
-            return []
+        query_lower = query.lower()
+        scored = []
+        for doc in self.documents:
+            content_lower = doc["content"].lower()
+            score = sum(1 for word in query_lower.split() if word in content_lower)
+            scored.append((score, doc))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [{"content": d["content"], "metadata": d["metadata"], "score": float(s)} for s, d in scored[:k]]
 
     def add_fact(self, fact: str, source: str = "agent"):
         self.add_documents(texts=[fact], metadatas=[{"source": source, "type": "fact"}])
@@ -55,12 +33,7 @@ class LongTermMemory:
         return "\n\n".join([r["content"] for r in results])
 
     def get_collection_count(self) -> int:
-        try:
-            if self.vectorstore:
-                return self.vectorstore._collection.count()
-            return 0
-        except:
-            return 0
+        return len(self.documents)
 
 
 _long_term_memory: Optional[LongTermMemory] = None

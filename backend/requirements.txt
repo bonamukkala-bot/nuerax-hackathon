@@ -9,7 +9,6 @@ langchain-community
 langchain-groq
 langchain-text-splitters
 langgraph
-chromadb==0.5.15
 pymupdf
 pandas
 openpyxl
