@@ -1,28 +1,21 @@
 import os
 import uuid
 from typing import List, Dict, Any, Tuple
+import pandas as pd
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from tools.file_reader_tool import read_file, register_file
 
-
-# Folder to store uploaded files
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 def save_uploaded_file(file_bytes: bytes, original_filename: str) -> Tuple[str, str]:
-    """
-    Save uploaded file bytes to disk.
-    Returns (file_id, file_path)
-    """
     file_id = str(uuid.uuid4())[:8]
     ext = os.path.splitext(original_filename)[1].lower()
     safe_name = f"{file_id}{ext}"
     file_path = os.path.join(UPLOAD_DIR, safe_name)
-
     with open(file_path, "wb") as f:
         f.write(file_bytes)
-
     register_file(file_id, file_path, original_filename)
     return file_id, file_path
 
@@ -33,17 +26,12 @@ def load_and_chunk(
     chunk_size: int = 1000,
     chunk_overlap: int = 100
 ) -> List[Dict[str, Any]]:
-    """
-    Load a file, extract text, split into chunks.
-    """
     raw_text = read_file(file_path, original_filename)
-
-    if not raw_text.strip():
+    if not raw_text or raw_text.startswith("Error"):
         return []
 
     ext = os.path.splitext(original_filename)[1].lower()
 
-    # For CSV/Excel — don't chunk, treat as structured data
     if ext in [".csv", ".xlsx", ".xls"]:
         return [{
             "content": raw_text,
@@ -54,38 +42,30 @@ def load_and_chunk(
             }
         }]
 
-    # For text-based files — chunk them
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         separators=["\n\n", "\n", ". ", " ", ""]
     )
-
     chunks = splitter.split_text(raw_text)
-
-    result = []
-    for i, chunk in enumerate(chunks):
-        if chunk.strip():
-            result.append({
-                "content": chunk,
-                "metadata": {
-                    "source": original_filename,
-                    "type": "text",
-                    "chunk_index": i,
-                    "total_chunks": len(chunks)
-                }
-            })
-
-    return result
+    return [
+        {
+            "content": chunk,
+            "metadata": {
+                "source": original_filename,
+                "type": "text",
+                "chunk_index": i,
+                "total_chunks": len(chunks)
+            }
+        }
+        for i, chunk in enumerate(chunks) if chunk.strip()
+    ]
 
 
 def process_uploaded_file(
     file_bytes: bytes,
     original_filename: str
 ) -> Dict[str, Any]:
-    """
-    Full pipeline: save → read → chunk → store in vector DB.
-    """
     try:
         # Step 1: Save file
         file_id, file_path = save_uploaded_file(file_bytes, original_filename)
@@ -103,16 +83,18 @@ def process_uploaded_file(
             }
 
         # Step 3: Store in long-term memory
+        # Only embed small files to avoid slow uploads
         try:
-            from memory.long_term import get_long_term_memory
-            ltm = get_long_term_memory()
-            texts = [c["content"] for c in chunks]
-            metadatas = [c["metadata"] for c in chunks]
-            ltm.add_documents(texts, metadatas)
-        except Exception as e:
-            print(f"Vector store warning: {e}")
+            if len(chunks) <= 20:
+                from memory.long_term import get_long_term_memory
+                ltm = get_long_term_memory()
+                texts = [c["content"] for c in chunks]
+                metadatas = [c["metadata"] for c in chunks]
+                ltm.add_documents(texts, metadatas)
+        except Exception:
+            pass  # Don't fail upload if embedding fails
 
-        # Step 4: Preview
+        ext = os.path.splitext(original_filename)[1].lower()
         preview = chunks[0]["content"][:300] if chunks else ""
 
         return {
@@ -120,10 +102,10 @@ def process_uploaded_file(
             "file_id": file_id,
             "filename": original_filename,
             "file_path": file_path,
-            "extension": os.path.splitext(original_filename)[1].lower(),
+            "extension": ext,
             "chunks": len(chunks),
             "preview": preview,
-            "message": f"Successfully processed '{original_filename}' into {len(chunks)} chunks."
+            "message": f"Successfully processed '{original_filename}'"
         }
 
     except Exception as e:

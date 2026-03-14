@@ -1,92 +1,114 @@
 from typing import List, Dict, Any, Optional
 from memory.short_term import get_session_memory
 from memory.long_term import get_long_term_memory
+from memory.episodic import save_agent_run, save_tool_call, get_recent_runs
 
 
-class AgentMemoryManager:
+class MemoryManager:
     """
-    Unified memory manager for the agent.
-    Combines short-term, long-term, and episodic memory.
+    Unified memory manager that coordinates all three memory layers.
     """
 
     def __init__(self, session_id: str):
         self.session_id = session_id
         self.short_term = get_session_memory(session_id)
         self.long_term = get_long_term_memory()
+        self.current_run_id: Optional[int] = None
 
     def add_user_message(self, message: str):
-        """Add user message to short-term memory."""
         self.short_term.add_message("user", message)
 
     def add_agent_message(self, message: str):
-        """Add agent response to short-term memory."""
         self.short_term.add_message("assistant", message)
 
-    def add_tool_result(self, tool_name: str, result: str):
-        """Store tool result in short-term memory."""
-        self.short_term.set_session_data(
-            f"tool_{tool_name}_last_result",
-            result[:500]
-        )
+    def add_thought(self, thought: str):
+        self.short_term.add_message("thought", thought)
 
     def get_conversation_context(self) -> str:
-        """Get recent conversation as context string."""
         return self.short_term.get_context_string()
 
-    def search_relevant_knowledge(self, query: str, k: int = 3) -> str:
-        """Search long-term memory for relevant information."""
+    def search_relevant_docs(self, query: str, k: int = 3) -> str:
         return self.long_term.search_relevant_context(query, k=k)
 
-    def store_knowledge(self, text: str, source: str = "agent"):
-        """Store new knowledge in long-term memory."""
-        self.long_term.add_fact(text, source)
-
     def get_full_context(self, query: str) -> str:
-        """
-        Get combined context from all memory layers.
-        Used to enrich agent prompts.
-        """
         parts = []
 
-        # Short-term conversation context
-        conversation = self.get_conversation_context()
-        if conversation:
-            parts.append(f"Recent conversation:\n{conversation}")
+        conv = self.get_conversation_context()
+        if conv:
+            parts.append(f"Recent conversation:\n{conv}")
 
-        # Long-term relevant knowledge
-        knowledge = self.search_relevant_knowledge(query)
-        if knowledge:
-            parts.append(f"Relevant knowledge from uploaded files:\n{knowledge}")
+        docs = self.search_relevant_docs(query)
+        if docs:
+            parts.append(f"Relevant documents:\n{docs}")
 
-        return "\n\n".join(parts) if parts else ""
+        return "\n\n".join(parts)
 
-    def set_uploaded_file(self, file_id: str, filename: str):
-        """Remember that a file was uploaded in this session."""
-        files = self.short_term.get_session_data("uploaded_files", [])
-        files.append({"file_id": file_id, "filename": filename})
-        self.short_term.set_session_data("uploaded_files", files)
+    def log_tool_call(
+        self,
+        tool_name: str,
+        tool_input: str,
+        tool_output: str,
+        success: bool
+    ):
+        try:
+            save_tool_call(
+                session_id=self.session_id,
+                run_id=self.current_run_id,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                tool_output=tool_output,
+                success=success
+            )
+        except Exception:
+            pass
 
-    def get_uploaded_files(self) -> List[Dict[str, Any]]:
-        """Get list of uploaded files in this session."""
-        return self.short_term.get_session_data("uploaded_files", [])
+    def save_run(
+        self,
+        task: str,
+        subtasks: List[str],
+        tools_used: List[str],
+        final_answer: str,
+        confidence: float,
+        duration: float,
+        status: str = "completed"
+    ) -> int:
+        try:
+            run_id = save_agent_run(
+                session_id=self.session_id,
+                task=task,
+                subtasks=subtasks,
+                tools_used=tools_used,
+                final_answer=final_answer,
+                confidence=confidence,
+                duration=duration,
+                status=status
+            )
+            self.current_run_id = run_id
+            return run_id
+        except Exception:
+            return 0
 
-    def set_current_task(self, task: str):
-        """Store the current task being executed."""
-        self.short_term.set_session_data("current_task", task)
+    def get_recent_history(self, limit: int = 5) -> List[Dict[str, Any]]:
+        try:
+            return get_recent_runs(self.session_id, limit=limit)
+        except Exception:
+            return []
 
-    def get_current_task(self) -> Optional[str]:
-        """Get the current task."""
-        return self.short_term.get_session_data("current_task")
+    def set_file_context(self, file_id: str, filename: str, preview: str):
+        self.short_term.set_session_data("uploaded_file_id", file_id)
+        self.short_term.set_session_data("uploaded_filename", filename)
+        self.short_term.set_session_data("file_preview", preview)
+
+    def get_file_context(self) -> str:
+        file_id = self.short_term.get_session_data("uploaded_file_id")
+        filename = self.short_term.get_session_data("uploaded_filename")
+        if file_id and filename:
+            return f"Uploaded file: {filename} (ID: {file_id})"
+        return ""
 
     def clear_session(self):
-        """Clear all short-term memory for this session."""
         self.short_term.clear()
 
-    def get_memory_summary(self) -> Dict[str, Any]:
-        """Get a summary of current memory state."""
-        return {
-            "session_id": self.session_id,
-            "short_term": self.short_term.get_summary(),
-            "long_term_docs": self.long_term.get_collection_count(),
-            "uploaded_files": self.get_uploaded_files()
-        }
+
+# Keep old name as alias so nothing breaks
+AgentMemoryManager = MemoryManager

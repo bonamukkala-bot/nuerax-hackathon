@@ -1,28 +1,29 @@
 import os
 import uuid
+import asyncio
 import json
 import time
-import asyncio
 from typing import Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
+
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from agent.graph import run_agent
-from agent.memory_manager import AgentMemoryManager
-from ingestion.universal_loader import process_uploaded_file
-from memory.episodic import get_all_runs, get_recent_runs
-from tools.data_analyzer_tool import generate_chart_data
-from tools.file_reader_tool import _uploaded_files
-
 load_dotenv()
 
-# ─── App Setup ─────────────────────────────────────────────
+from agent.graph import run_agent
+from ingestion.universal_loader import process_uploaded_file
+from memory.episodic import get_all_runs, init_db
+from memory.short_term import get_session_memory
+from tools import get_all_tool_descriptions, get_registered_files
+
+init_db()
+
 app = FastAPI(
-    title="NEXUS AGENT API",
-    description="Autonomous AI Agent Platform",
+    title="NEXUS Agent API",
+    description="Autonomous AI Agent — NeuraX 2.0 Hackathon",
     version="1.0.0"
 )
 
@@ -35,40 +36,50 @@ app.add_middleware(
 )
 
 
-# ─── Request Models ────────────────────────────────────────
-class ChatRequest(BaseModel):
+class QueryRequest(BaseModel):
     task: str
     session_id: Optional[str] = None
+    file_id: Optional[str] = None
+    filename: Optional[str] = None
 
 
-class ClearRequest(BaseModel):
-    session_id: str
-
-
-# ─── Health Check ──────────────────────────────────────────
-@app.get("/health")
-async def health():
+@app.get("/")
+def root():
     return {
-        "status": "ok",
-        "message": "NEXUS AGENT is running",
-        "timestamp": time.time()
+        "name": "NEXUS Autonomous Agent",
+        "status": "running",
+        "version": "1.0.0",
+        "hackathon": "NeuraX 2.0"
     }
 
 
-# ─── File Upload ───────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {"status": "ok", "timestamp": time.time()}
+
+
+@app.get("/tools")
+def list_tools():
+    return {
+        "tools": get_all_tool_descriptions(),
+        "registered_files": get_registered_files()
+    }
+
+
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
         file_bytes = await file.read()
+
         if len(file_bytes) == 0:
-            raise HTTPException(status_code=400, detail="Empty file")
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
 
         result = process_uploaded_file(file_bytes, file.filename)
 
         if not result["success"]:
             raise HTTPException(
-                status_code=400,
-                detail=result.get("error", "Failed to process file")
+                status_code=500,
+                detail=f"Failed to process file: {result.get('error', 'Unknown error')}"
             )
 
         return JSONResponse(content={
@@ -86,202 +97,183 @@ async def upload_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── Chat Endpoint (REST) ──────────────────────────────────
-@app.post("/chat")
-async def chat(request: ChatRequest):
-    try:
-        session_id = request.session_id or str(uuid.uuid4())
+@app.post("/query")
+async def query_agent(request: QueryRequest):
+    session_id = request.session_id or str(uuid.uuid4())[:8]
 
-        memory = AgentMemoryManager(session_id)
-        context = memory.get_full_context(request.task)
-        memory.add_user_message(request.task)
+    if request.file_id and request.filename:
+        session_mem = get_session_memory(session_id)
+        session_mem.set_session_data("uploaded_file_id", request.file_id)
+        session_mem.set_session_data("uploaded_filename", request.filename)
 
-        result = await run_agent(
-            task=request.task,
-            session_id=session_id,
-            context=context
-        )
+    events = []
+    final_answer = None
 
-        memory.add_agent_message(result.get("answer", ""))
+    async for event in run_agent(request.task, session_id):
+        events.append(event)
+        if event["type"] == "answer":
+            final_answer = event
 
+    if final_answer:
         return JSONResponse(content={
             "success": True,
             "session_id": session_id,
             "task": request.task,
-            "answer": result.get("answer", ""),
-            "confidence": result.get("confidence", 0),
-            "tools_used": result.get("tools_used", []),
-            "steps": result.get("steps", []),
-            "thoughts": result.get("thoughts", [])
+            "answer": final_answer["content"],
+            "confidence": final_answer.get("confidence", 0),
+            "tools_used": final_answer.get("tools_used", []),
+            "duration": final_answer.get("duration", 0),
+            "steps": final_answer.get("steps", 0),
+            "events": events
         })
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    for event in events:
+        if event["type"] == "error":
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "session_id": session_id,
+                    "error": event.get("content", "Unknown error"),
+                    "events": events
+                }
+            )
 
-
-# ─── WebSocket Streaming ───────────────────────────────────
-@app.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    await websocket.accept()
-
-    try:
-        while True:
-            # Receive task from client
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            task = message.get("task", "")
-
-            if not task:
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "content": "No task provided"
-                }))
-                continue
-
-            # Send acknowledgment
-            await websocket.send_text(json.dumps({
-                "type": "start",
-                "content": f"Starting task: {task}"
-            }))
-
-            # Memory context
-            memory = AgentMemoryManager(session_id)
-            context = memory.get_full_context(task)
-            memory.add_user_message(task)
-
-            # Thought streaming callback
-            thoughts_sent = []
-
-            async def stream_thought(thought: str):
-                thoughts_sent.append(thought)
-                await websocket.send_text(json.dumps({
-                    "type": "thought",
-                    "content": thought
-                }))
-                await asyncio.sleep(0.05)
-
-            # Run agent with streaming
-            try:
-                # Stream planning phase
-                await websocket.send_text(json.dumps({
-                    "type": "thought",
-                    "content": "Analyzing task and creating execution plan..."
-                }))
-
-                result = await run_agent(
-                    task=task,
-                    session_id=session_id,
-                    context=context,
-                    on_thought=stream_thought
-                )
-
-                # Stream each step result
-                for step in result.get("steps", []):
-                    await websocket.send_text(json.dumps({
-                        "type": "step",
-                        "content": {
-                            "step": step.get("step", 0),
-                            "subtask": step.get("subtask", ""),
-                            "tool": step.get("tool", ""),
-                            "success": step.get("success", True),
-                            "result_preview": str(step.get("result", ""))[:200]
-                        }
-                    }))
-                    await asyncio.sleep(0.1)
-
-                memory.add_agent_message(result.get("answer", ""))
-
-                # Send final answer
-                await websocket.send_text(json.dumps({
-                    "type": "answer",
-                    "content": {
-                        "answer": result.get("answer", ""),
-                        "confidence": result.get("confidence", 0),
-                        "tools_used": result.get("tools_used", []),
-                        "steps_count": len(result.get("steps", [])),
-                        "thoughts": result.get("thoughts", [])
-                    }
-                }))
-
-            except Exception as e:
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "content": f"Agent error: {str(e)}"
-                }))
-
-    except WebSocketDisconnect:
-        print(f"Client disconnected: {session_id}")
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-
-
-# ─── History ───────────────────────────────────────────────
-@app.get("/history/{session_id}")
-async def get_history(session_id: str):
-    try:
-        runs = get_recent_runs(session_id, limit=20)
-        return JSONResponse(content={"success": True, "runs": runs})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return JSONResponse(
+        status_code=500,
+        content={"success": False, "error": "No answer generated", "events": events}
+    )
 
 
 @app.get("/history")
-async def get_all_history():
-    try:
-        runs = get_all_runs(limit=50)
-        return JSONResponse(content={"success": True, "runs": runs})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def get_history():
+    runs = get_all_runs(limit=50)
+    return {"runs": runs}
 
 
-# ─── Chart Data ────────────────────────────────────────────
-@app.get("/charts/{file_id}")
-async def get_charts(file_id: str):
+@app.get("/history/{session_id}")
+def get_session_history(session_id: str):
+    session_mem = get_session_memory(session_id)
+    messages = session_mem.get_messages()
+    runs = get_all_runs(limit=50)
+    session_runs = [r for r in runs if r.get("session_id") == session_id]
+    return {
+        "session_id": session_id,
+        "messages": messages,
+        "runs": session_runs,
+        "total_messages": len(messages)
+    }
+
+
+@app.delete("/history/{session_id}")
+def clear_session_history(session_id: str):
+    from memory.short_term import clear_session_memory
+    clear_session_memory(session_id)
+    return {"success": True, "message": f"Session {session_id} cleared"}
+
+
+# ─── EDA Endpoint ──────────────────────────────────────────
+@app.post("/eda/{file_id}")
+async def run_eda(file_id: str):
     try:
+        from tools.file_reader_tool import _uploaded_files
+        from tools.data_analyzer_tool import run_full_eda
+
         if file_id not in _uploaded_files:
-            raise HTTPException(status_code=404, detail="File not found")
+            raise HTTPException(
+                status_code=404,
+                detail="File not found. Please upload first."
+            )
 
         file_info = _uploaded_files[file_id]
-        chart_data = generate_chart_data(file_info["path"])
+        file_path = file_info["path"]
+        ext = file_info.get("extension", "")
 
-        return JSONResponse(content=chart_data)
+        if ext not in [".csv", ".xlsx", ".xls", ".json"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"EDA only supports CSV, Excel, JSON files. Got: {ext}"
+            )
+
+        result = run_full_eda(file_path)
+
+        if not result["success"]:
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("error", "EDA failed")
+            )
+
+        return JSONResponse(content={
+            "success": True,
+            "file_id": file_id,
+            "filename": file_info["name"],
+            "summary": result["summary"],
+            "charts": result["charts"],
+            "stats_output": result["stats_output"],
+            "ai_insights": result["ai_insights"],
+            "report": result["report"]
+        })
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── Files List ────────────────────────────────────────────
-@app.get("/files")
-async def list_files():
+# ─── WebSocket ─────────────────────────────────────────────
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+
     try:
-        files = []
-        for file_id, info in _uploaded_files.items():
-            files.append({
-                "file_id": file_id,
-                "filename": info["name"],
-                "extension": info["extension"]
-            })
-        return JSONResponse(content={"success": True, "files": files})
+        while True:
+            data = await websocket.receive_text()
+
+            try:
+                message = json.loads(data)
+                task = message.get("task", "").strip()
+                file_id = message.get("file_id", "")
+                filename = message.get("filename", "")
+
+                if not task:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "content": "Empty task received"
+                    }))
+                    continue
+
+                if file_id and filename:
+                    session_mem = get_session_memory(session_id)
+                    session_mem.set_session_data("uploaded_file_id", file_id)
+                    session_mem.set_session_data("uploaded_filename", filename)
+
+                async for event in run_agent(task, session_id):
+                    await websocket.send_text(json.dumps(event))
+                    await asyncio.sleep(0.05)
+
+            except json.JSONDecodeError:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "content": "Invalid JSON received"
+                }))
+
+    except WebSocketDisconnect:
+        pass
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "content": f"Server error: {str(e)}"
+            }))
+        except Exception:
+            pass
 
 
-# ─── Clear Session ─────────────────────────────────────────
-@app.post("/clear")
-async def clear_session(request: ClearRequest):
-    try:
-        from memory.short_term import clear_session_memory
-        clear_session_memory(request.session_id)
-        return JSONResponse(content={
-            "success": True,
-            "message": f"Session {request.session_id} cleared"
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ─── Run Server ────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
