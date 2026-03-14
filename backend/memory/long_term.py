@@ -1,44 +1,20 @@
 import os
 from typing import List, Dict, Any, Optional
 from langchain_community.vectorstores import Chroma
-from langchain_core.documents import Document
-
+from langchain_community.embeddings import FakeEmbeddings
+from langchain.schema import Document
 
 CHROMA_DB_PATH = os.path.join(os.path.dirname(__file__), "chroma_db")
 
 
 class LongTermMemory:
     def __init__(self):
-        self.embeddings = None
+        self.embeddings = FakeEmbeddings(size=384)
         self.vectorstore = None
-        self._init_embeddings()
         self._init_vectorstore()
-
-    def _init_embeddings(self):
-        try:
-            from langchain_huggingface import HuggingFaceEmbeddings
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name="all-MiniLM-L6-v2",
-                model_kwargs={"device": "cpu"},
-                encode_kwargs={"normalize_embeddings": True}
-            )
-        except Exception as e:
-            print(f"HuggingFace embeddings warning: {e}")
-            try:
-                from langchain_community.embeddings import HuggingFaceEmbeddings
-                self.embeddings = HuggingFaceEmbeddings(
-                    model_name="all-MiniLM-L6-v2",
-                    model_kwargs={"device": "cpu"},
-                    encode_kwargs={"normalize_embeddings": True}
-                )
-            except Exception as e2:
-                print(f"Embeddings fallback also failed: {e2}")
-                self.embeddings = None
 
     def _init_vectorstore(self):
         try:
-            if self.embeddings is None:
-                return
             self.vectorstore = Chroma(
                 collection_name="nexus_memory",
                 embedding_function=self.embeddings,
@@ -58,30 +34,19 @@ class LongTermMemory:
                 docs.append(Document(page_content=text, metadata=metadata))
             self.vectorstore.add_documents(docs)
         except Exception as e:
-            print(f"Error adding documents: {e}")
+            print(f"Error adding to long term memory: {e}")
 
     def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         if self.vectorstore is None:
             return []
         try:
             results = self.vectorstore.similarity_search_with_score(query, k=k)
-            output = []
-            for doc, score in results:
-                output.append({
-                    "content": doc.page_content,
-                    "metadata": doc.metadata,
-                    "score": float(score)
-                })
-            return output
-        except Exception as e:
-            print(f"Error searching memory: {e}")
+            return [{"content": doc.page_content, "metadata": doc.metadata, "score": float(score)} for doc, score in results]
+        except Exception:
             return []
 
     def add_fact(self, fact: str, source: str = "agent"):
-        self.add_documents(
-            texts=[fact],
-            metadatas=[{"source": source, "type": "fact"}]
-        )
+        self.add_documents(texts=[fact], metadatas=[{"source": source, "type": "fact"}])
 
     def search_relevant_context(self, query: str, k: int = 3) -> str:
         results = self.search(query, k=k)
@@ -98,7 +63,6 @@ class LongTermMemory:
             return 0
 
 
-# Singleton instance
 _long_term_memory: Optional[LongTermMemory] = None
 
 
