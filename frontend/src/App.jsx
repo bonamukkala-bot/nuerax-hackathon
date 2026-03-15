@@ -4,6 +4,7 @@ import { onAuthStateChanged, signOut } from 'firebase/auth'
 import Auth from './Auth'
 
 const API_URL = 'https://nuerax-hackathon.onrender.com'
+const WS_URL = 'wss://nuerax-hackathon.onrender.com'
 
 function App() {
   const [user, setUser] = useState(null)
@@ -26,9 +27,11 @@ function App() {
   const [edaData, setEdaData] = useState(null)
   const [edaLoading, setEdaLoading] = useState(false)
   const [edaFile, setEdaFile] = useState(null)
+  const [wsConnected, setWsConnected] = useState(false)
   const wsRef = useRef(null)
   const messagesEndRef = useRef(null)
   const fileInputRef = useRef(null)
+  const reconnectTimer = useRef(null)
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
@@ -39,8 +42,13 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (user) connectWebSocket()
-    return () => wsRef.current?.close()
+    if (user) {
+      connectWebSocket()
+    }
+    return () => {
+      if (wsRef.current) wsRef.current.close()
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
+    }
   }, [user])
 
   useEffect(() => {
@@ -49,8 +57,19 @@ function App() {
 
   const connectWebSocket = () => {
     try {
-      const ws = new WebSocket(`wss://nuerax-hackathon.onrender.com/ws/${sessionId}`)
-      ws.onopen = () => console.log('Connected to NEXUS AGENT')
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return
+
+      const ws = new WebSocket(`${WS_URL}/ws/${sessionId}`)
+
+      ws.onopen = () => {
+        console.log('✅ Connected to NEXUS AGENT')
+        setWsConnected(true)
+        setMessages(prev => prev.filter(m =>
+          m.content !== 'Connection lost. Please refresh the page.' &&
+          m.content !== '⚡ Reconnecting to server...'
+        ))
+      }
+
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data)
@@ -59,11 +78,23 @@ function App() {
           console.error('WS parse error:', e)
         }
       }
-      ws.onclose = () => setTimeout(connectWebSocket, 2000)
-      ws.onerror = (e) => console.error('WS error:', e)
+
+      ws.onclose = () => {
+        console.log('WS closed, reconnecting in 3s...')
+        setWsConnected(false)
+        setIsLoading(false)
+        reconnectTimer.current = setTimeout(connectWebSocket, 3000)
+      }
+
+      ws.onerror = (e) => {
+        console.error('WS error:', e)
+        setWsConnected(false)
+      }
+
       wsRef.current = ws
     } catch (e) {
       console.error('WS connect error:', e)
+      reconnectTimer.current = setTimeout(connectWebSocket, 3000)
     }
   }
 
@@ -94,11 +125,6 @@ function App() {
         confidence: data.confidence || 0,
         tools_used: data.tools_used || [],
         steps_count: data.steps || 0,
-        youtube_url: data.youtube_url || '',
-        youtube_label: data.youtube_label || '',
-        images: data.images || [],
-        topic: data.topic || '',
-        bing_images_url: data.bing_images_url || ''
       }])
     } else if (data.type === 'error') {
       setIsLoading(false)
@@ -113,25 +139,28 @@ function App() {
 
   const sendMessage = () => {
     if (!input.trim() || isLoading) return
+
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      setMessages(prev => [...prev, {
+        role: 'system',
+        content: '⚡ Reconnecting to server... Please wait 5 seconds and try again.',
+        isError: true
+      }])
+      connectWebSocket()
+      return
+    }
+
     const task = input.trim()
     setInput('')
     setThoughts([])
     setIsLoading(true)
     setMessages(prev => [...prev, { role: 'user', content: task }])
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        task,
-        file_id: uploadedFile?.file_id || '',
-        filename: uploadedFile?.filename || ''
-      }))
-    } else {
-      setIsLoading(false)
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: 'Connection lost. Please refresh the page.',
-        isError: true
-      }])
-    }
+
+    wsRef.current.send(JSON.stringify({
+      task,
+      file_id: uploadedFile?.file_id || '',
+      filename: uploadedFile?.filename || ''
+    }))
   }
 
   const handleFileUpload = async (e) => {
@@ -277,8 +306,8 @@ function App() {
     'Search latest AI news in 2025',
     'Calculate compound interest: 50000 at 10% for 5 years',
     'Write Python code for bubble sort',
-    'Explain how RAG works in AI',
-    'Best practices for prompt engineering'
+    'Explain how neural networks work',
+    'What are the best practices for prompt engineering?'
   ]
 
   const edaSupportedExts = ['csv', 'xlsx', 'xls', 'json']
@@ -295,7 +324,7 @@ function App() {
   return (
     <div style={{ display: 'flex', height: '100vh', background: '#0a0a0a', color: '#e2e8f0', fontFamily: '-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif' }}>
 
-      {/* ── SIDEBAR ── */}
+      {/* SIDEBAR */}
       <div style={{ width: '240px', background: '#0f0f0f', borderRight: '1px solid #1a1a1a', display: 'flex', flexDirection: 'column', padding: '20px 14px', gap: '6px' }}>
         <div style={{ marginBottom: '20px' }}>
           <h1 style={{ fontSize: '18px', fontWeight: '700', color: '#6366f1', margin: 0 }}>⚡ NEXUS AGENT</h1>
@@ -328,6 +357,14 @@ function App() {
         )}
 
         <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          {/* Connection Status */}
+          <div style={{ padding: '6px 10px', background: wsConnected ? '#0a1f15' : '#1a0808', border: `1px solid ${wsConnected ? '#10b981' : '#ef4444'}`, borderRadius: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <div style={{ width: '6px', height: '6px', borderRadius: '50%', background: wsConnected ? '#10b981' : '#ef4444', animation: wsConnected ? 'none' : 'pulse 1s infinite' }} />
+            <p style={{ fontSize: '11px', color: wsConnected ? '#10b981' : '#ef4444', margin: 0 }}>
+              {wsConnected ? 'Connected' : 'Reconnecting...'}
+            </p>
+          </div>
+
           <div style={{ padding: '10px', background: '#1a1a1a', borderRadius: '8px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               {user.photoURL
@@ -349,7 +386,7 @@ function App() {
         </div>
       </div>
 
-      {/* ── MAIN ── */}
+      {/* MAIN */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
 
         {/* Header */}
@@ -374,7 +411,7 @@ function App() {
           )}
         </div>
 
-        {/* ── CHAT TAB ── */}
+        {/* CHAT TAB */}
         {activeTab === 'chat' && (
           <>
             <div style={{ flex: 1, overflowY: 'auto', padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -409,55 +446,10 @@ function App() {
                     <div style={{ fontSize: '14px', lineHeight: '1.6' }}>
                       {msg.content ? renderMessage(msg.content) : null}
                     </div>
-
-                    {/* YouTube */}
-                    {msg.role === 'assistant' && msg.youtube_url && (
-                      <div style={{ marginTop: '14px', paddingTop: '12px', borderTop: '1px solid #222' }}>
-                        <p style={{ fontSize: '11px', color: '#555', margin: '0 0 8px', fontWeight: '600' }}>📺 Watch and Learn</p>
-                        <a href={msg.youtube_url} target="_blank" rel="noopener noreferrer"
-                          style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '8px 14px', background: '#1a0808', border: '1px solid #7f1d1d', borderRadius: '8px', color: '#fca5a5', fontSize: '13px', fontWeight: '600', textDecoration: 'none' }}
-                          onMouseEnter={e => { e.currentTarget.style.background = '#2a0808'; e.currentTarget.style.borderColor = '#ef4444' }}
-                          onMouseLeave={e => { e.currentTarget.style.background = '#1a0808'; e.currentTarget.style.borderColor = '#7f1d1d' }}>
-                          ▶ {msg.youtube_label || 'Watch on YouTube'}
-                        </a>
-                      </div>
-                    )}
-
-                    {/* Bing Images */}
-                    {msg.role === 'assistant' && msg.bing_images_url && (
-                      <div style={{ marginTop: '8px' }}>
-                        <a href={msg.bing_images_url} target="_blank" rel="noopener noreferrer"
-                          style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '7px 12px', background: '#0a1020', border: '1px solid #1e3a5f', borderRadius: '8px', color: '#93c5fd', fontSize: '12px', fontWeight: '600', textDecoration: 'none' }}
-                          onMouseEnter={e => { e.currentTarget.style.background = '#0f1a30'; e.currentTarget.style.borderColor = '#3b82f6' }}
-                          onMouseLeave={e => { e.currentTarget.style.background = '#0a1020'; e.currentTarget.style.borderColor = '#1e3a5f' }}>
-                          🔍 Search Images on Bing
-                        </a>
-                      </div>
-                    )}
-
-                    {/* Placeholder Images */}
-                    {msg.role === 'assistant' && msg.images && msg.images.length > 0 && (
-                      <div style={{ marginTop: '14px' }}>
-                        <p style={{ fontSize: '11px', color: '#555', marginBottom: '8px', fontWeight: '600' }}>🖼️ Visual Reference</p>
-                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                          {msg.images.map((url, idx) => (
-                            <img key={idx} src={url} alt={msg.topic || 'related'}
-                              style={{ width: '130px', height: '85px', objectFit: 'cover', borderRadius: '8px', border: '1px solid #222', cursor: 'pointer' }}
-                              onClick={() => window.open(msg.bing_images_url || url, '_blank')}
-                              onError={e => { e.target.style.display = 'none' }}
-                              onMouseEnter={e => { e.target.style.border = '1px solid #6366f1' }}
-                              onMouseLeave={e => { e.target.style.border = '1px solid #222' }}
-                            />
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Confidence */}
                     {msg.role === 'assistant' && msg.confidence > 0 && (
                       <div style={{ marginTop: '10px', paddingTop: '8px', borderTop: '1px solid #222', display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' }}>
                         <span style={{ fontSize: '11px', color: '#6366f1', background: '#1e1e3f', padding: '2px 8px', borderRadius: '4px' }}>
-                          {Math.round(msg.confidence * 100)}% confidence
+                          {Math.round(msg.confidence)}% confidence
                         </span>
                         {msg.tools_used?.map((t, j) => (
                           <span key={j} style={{ fontSize: '11px', color: '#10b981', background: '#0a1f15', padding: '2px 8px', borderRadius: '4px' }}>🔧 {t}</span>
@@ -527,7 +519,7 @@ function App() {
           </>
         )}
 
-        {/* ── FILES TAB ── */}
+        {/* FILES TAB */}
         {activeTab === 'files' && (
           <div style={{ flex: 1, padding: '24px', overflowY: 'auto' }}>
             {uploadedFiles.length === 0 ? (
@@ -563,7 +555,7 @@ function App() {
           </div>
         )}
 
-        {/* ── EDA TAB ── */}
+        {/* EDA TAB */}
         {activeTab === 'eda' && (
           <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
             {!edaFile && !edaLoading && (
@@ -571,12 +563,9 @@ function App() {
                 <p style={{ fontSize: '48px', marginBottom: '12px' }}>📊</p>
                 <p style={{ color: '#e2e8f0', fontSize: '18px', fontWeight: '600', marginBottom: '8px' }}>Agentic AI EDA Pipeline</p>
                 <p style={{ color: '#555', fontSize: '14px', marginBottom: '24px' }}>Upload a CSV, Excel, or JSON file then click the EDA button</p>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', maxWidth: '400px', margin: '0 auto', background: '#111', border: '1px solid #1a1a1a', borderRadius: '12px', padding: '20px' }}>
-                  <p style={{ color: '#a5b4fc', fontWeight: '600', fontSize: '14px', margin: 0 }}>What EDA does:</p>
-                  {['🤖 Coder Agent writes Python EDA code automatically', '📊 Generates distribution charts for all columns', '🔥 Correlation heatmap', '❓ Missing values analysis', '🧠 Analyst Agent explains findings in plain English', '📄 Download full EDA report'].map((item, i) => (
-                    <div key={i} style={{ display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
-                      <p style={{ fontSize: '13px', color: '#888', margin: 0 }}>{item}</p>
-                    </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', maxWidth: '400px', margin: '0 auto', background: '#111', border: '1px solid #1a1a1a', borderRadius: '12px', padding: '20px' }}>
+                  {['🤖 Coder Agent writes EDA code automatically', '📊 Distribution charts for all columns', '🔥 Correlation heatmap', '❓ Missing values analysis', '🧠 Analyst Agent explains findings', '📄 Downloadable EDA report'].map((item, i) => (
+                    <p key={i} style={{ fontSize: '13px', color: '#888', margin: 0 }}>{item}</p>
                   ))}
                 </div>
               </div>
@@ -596,11 +585,9 @@ function App() {
 
             {edaData && !edaData.error && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
-
-                {/* Header */}
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <div>
-                    <p style={{ fontSize: '20px', fontWeight: '700', color: '#6366f1', margin: 0 }}>📊 EDA Report: {edaFile?.filename}</p>
+                    <p style={{ fontSize: '20px', fontWeight: '700', color: '#6366f1', margin: 0 }}>📊 EDA: {edaFile?.filename}</p>
                     <p style={{ fontSize: '12px', color: '#555', margin: '4px 0 0' }}>Generated by Agentic AI Pipeline</p>
                   </div>
                   <button onClick={() => downloadReport(edaData.report, edaFile?.filename)}
@@ -609,7 +596,6 @@ function App() {
                   </button>
                 </div>
 
-                {/* Summary Cards */}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px' }}>
                   {[
                     { label: 'Rows', value: edaData.summary?.rows, color: '#6366f1' },
@@ -624,41 +610,6 @@ function App() {
                   ))}
                 </div>
 
-                {/* Column Types */}
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-                  <div style={{ padding: '16px', background: '#111', border: '1px solid #1a1a1a', borderRadius: '10px' }}>
-                    <p style={{ fontSize: '13px', fontWeight: '600', color: '#a5b4fc', marginBottom: '10px' }}>📈 Numeric Columns ({edaData.summary?.numeric_cols?.length})</p>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-                      {edaData.summary?.numeric_cols?.map((col, i) => (
-                        <span key={i} style={{ fontSize: '11px', padding: '3px 8px', background: '#1e1e3f', color: '#a5b4fc', borderRadius: '4px' }}>{col}</span>
-                      ))}
-                    </div>
-                  </div>
-                  <div style={{ padding: '16px', background: '#111', border: '1px solid #1a1a1a', borderRadius: '10px' }}>
-                    <p style={{ fontSize: '13px', fontWeight: '600', color: '#10b981', marginBottom: '10px' }}>🏷️ Categorical Columns ({edaData.summary?.categorical_cols?.length})</p>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-                      {edaData.summary?.categorical_cols?.map((col, i) => (
-                        <span key={i} style={{ fontSize: '11px', padding: '3px 8px', background: '#0a1f15', color: '#10b981', borderRadius: '4px' }}>{col}</span>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Missing Values */}
-                {Object.keys(edaData.summary?.missing_values || {}).length > 0 && (
-                  <div style={{ padding: '16px', background: '#1a0808', border: '1px solid #7f1d1d', borderRadius: '10px' }}>
-                    <p style={{ fontSize: '13px', fontWeight: '600', color: '#fca5a5', marginBottom: '10px' }}>⚠️ Missing Values</p>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
-                      {Object.entries(edaData.summary?.missing_values || {}).map(([col, count], i) => (
-                        <span key={i} style={{ fontSize: '12px', padding: '4px 10px', background: '#2a0808', color: '#fca5a5', borderRadius: '6px' }}>
-                          {col}: {count} ({edaData.summary?.missing_pct?.[col]}%)
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* Charts */}
                 {edaData.charts && edaData.charts.length > 0 && (
                   <div>
                     <p style={{ fontSize: '16px', fontWeight: '600', color: '#e2e8f0', marginBottom: '16px' }}>📊 Generated Charts</p>
@@ -669,10 +620,7 @@ function App() {
                             <p style={{ fontSize: '13px', fontWeight: '600', color: '#a5b4fc', margin: 0 }}>{chart.title}</p>
                           </div>
                           <div style={{ padding: '16px' }}>
-                            <img src={`data:image/png;base64,${chart.image}`}
-                              alt={chart.title}
-                              style={{ width: '100%', borderRadius: '8px' }}
-                            />
+                            <img src={`data:image/png;base64,${chart.image}`} alt={chart.title} style={{ width: '100%', borderRadius: '8px' }} />
                           </div>
                         </div>
                       ))}
@@ -680,7 +628,6 @@ function App() {
                   </div>
                 )}
 
-                {/* AI Insights */}
                 {edaData.ai_insights && (
                   <div style={{ padding: '20px', background: '#0a1020', border: '1px solid #1e3a5f', borderRadius: '10px' }}>
                     <p style={{ fontSize: '16px', fontWeight: '600', color: '#93c5fd', marginBottom: '16px' }}>🧠 Analyst Agent Insights</p>
@@ -690,7 +637,6 @@ function App() {
                   </div>
                 )}
 
-                {/* Coder Agent Output */}
                 {edaData.stats_output && (
                   <div style={{ padding: '20px', background: '#0f1a0f', border: '1px solid #14532d', borderRadius: '10px' }}>
                     <p style={{ fontSize: '16px', fontWeight: '600', color: '#86efac', marginBottom: '16px' }}>🤖 Coder Agent Output</p>
@@ -699,7 +645,6 @@ function App() {
                     </pre>
                   </div>
                 )}
-
               </div>
             )}
 
@@ -712,7 +657,7 @@ function App() {
           </div>
         )}
 
-        {/* ── HISTORY TAB ── */}
+        {/* HISTORY TAB */}
         {activeTab === 'history' && (
           <div style={{ flex: 1, padding: '24px', overflowY: 'auto' }}>
             {history.length === 0 ? (
@@ -727,7 +672,7 @@ function App() {
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '8px' }}>
                       <p style={{ fontWeight: '600', fontSize: '14px', flex: 1, marginRight: '12px', color: '#e2e8f0' }}>{run.task || 'Unknown task'}</p>
                       <span style={{ fontSize: '12px', color: '#6366f1', background: '#1e1e3f', padding: '2px 8px', borderRadius: '4px', flexShrink: 0 }}>
-                        {Math.round((run.confidence || 0) * 100)}%
+                        {Math.round((run.confidence || 0))}%
                       </span>
                     </div>
                     <p style={{ fontSize: '13px', color: '#555', marginBottom: '8px', lineHeight: '1.5' }}>
